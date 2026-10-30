@@ -1,0 +1,5 @@
+{
+  "name":"chai-culture-store","version":"1.0.0","private":true,"type":"module",
+  "scripts":{"dev":"node server/index.js","build":"node --check public/app.js && node --check server/index.js","start":"NODE_ENV=production node server/index.js","admin:create":"node server/create-admin.js"},
+  "dependencies":{"express":"^4.21.2"}
+}

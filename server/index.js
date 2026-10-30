@@ -1,0 +1,32 @@
+import express from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+const __dirname=path.dirname(fileURLToPath(import.meta.url));
+const ROOT=path.resolve(__dirname,'..');
+const DB=fs.existsSync(path.join(ROOT,'data/store.json'))?path.join(ROOT,'data/store.json'):path.join(process.cwd(),'data/store.json');
+const app=express(); app.use(express.json({limit:'1mb'}));
+let memoryStore=null;
+const read=()=>{if(memoryStore)return memoryStore;try{memoryStore=JSON.parse(fs.readFileSync(DB,'utf8'));return memoryStore;}catch(err){if(memoryStore)return memoryStore;console.warn('Could not read store.json:',err.message);return{settings:{},products:[],orders:[],subscribers:[],coupons:[]};}};
+const save=d=>{memoryStore=d;try{fs.writeFileSync(DB,JSON.stringify(d,null,2));}catch(err){console.warn('Filesystem is read-only (serverless). Saved to memory:',err.message);}};
+const money=n=>Math.round(Number(n)||0);
+app.get('/api/health',(req,res)=>res.json({ok:true}));
+app.get('/api/products',(req,res)=>res.json(read().products));
+app.get('/api/settings',(req,res)=>res.json(read().settings));
+app.post('/api/newsletter',(req,res)=>{const email=String(req.body.email||'').trim().toLowerCase();if(!/^\S+@\S+\.\S+$/.test(email))return res.status(400).json({error:'Please enter a valid email address.'});const d=read();if(!d.subscribers.includes(email)){d.subscribers.push(email);save(d)}res.json({ok:true,message:'You are on the list. Chai soon!'});});
+app.post('/api/orders',(req,res)=>{const {customer,items,paymentMethod='COD',couponCode}=req.body||{};if(!customer?.name||!customer?.email||!customer?.phone||!customer?.address||!customer?.city||!customer?.postalCode)return res.status(400).json({error:'Please complete all required delivery details.'});if(!Array.isArray(items)||!items.length)return res.status(400).json({error:'Your cart is empty.'});const d=read();let subtotal=0;const lines=[];for(const item of items){const p=d.products.find(x=>x.id===item.productId);const qty=Math.floor(Number(item.quantity));if(!p||qty<1||qty>p.stock)return res.status(400).json({error:`${p?.name||'Product'} is no longer available in that quantity.`});const weight=String(item.weight||p.weight);const alternate=p.weight==='250 g'?'500 g':p.weight==='100 g'?'200 g':p.weight;if(weight!==p.weight&&weight!==alternate)return res.status(400).json({error:`${p.name} pack size is not available.`});const unitPrice=weight===p.weight?p.price:Math.round(p.price*1.72);subtotal+=unitPrice*qty;lines.push({productId:p.id,name:p.name,price:unitPrice,quantity:qty,weight});}
+let discount=0;if(couponCode){const c=d.coupons.find(x=>x.code.toUpperCase()===String(couponCode).toUpperCase()&&x.active);if(!c||subtotal<c.min)return res.status(400).json({error:'That discount code is invalid or the order minimum has not been met.'});discount=c.type==='percent'?Math.round(subtotal*c.amount/100):Math.min(subtotal,c.amount)}
+const shipping=subtotal-discount>=d.settings.freeShipping?0:money(d.settings.shipping);const order={id:crypto.randomUUID(),number:`CC-${Date.now().toString().slice(-8)}`,createdAt:new Date().toISOString(),customer,items:lines,subtotal,discount,shipping,total:subtotal-discount+shipping,paymentMethod,paymentStatus:'Pending',status:'Confirmed',statusHistory:[{status:'Confirmed',at:new Date().toISOString()}]};for(const item of lines){const p=d.products.find(x=>x.id===item.productId);p.stock-=item.quantity;}d.orders.unshift(order);save(d);res.status(201).json(order);});
+app.post('/api/admin/login',(req,res)=>{const d=read();const password=String(req.body.password||'');if(!d.adminHash)return res.status(503).json({error:'Admin is not set up yet. Run npm run admin:create to create a secure admin account.'});const hash=crypto.scryptSync(password,process.env.ADMIN_SALT||'chai-culture-local-salt',64).toString('hex');if(!crypto.timingSafeEqual(Buffer.from(hash,'hex'),Buffer.from(d.adminHash,'hex')))return res.status(401).json({error:'Incorrect password.'});const token=crypto.randomBytes(32).toString('hex');global.adminToken=token;res.json({token});});
+function admin(req,res,next){if(!global.adminToken||req.headers.authorization!==`Bearer ${global.adminToken}`)return res.status(401).json({error:'Admin authorization required.'});next()}
+app.get('/api/admin/summary',admin,(req,res)=>{const d=read();res.json({products:d.products,orders:d.orders,subscribers:d.subscribers.length,settings:d.settings,coupons:d.coupons})});
+app.patch('/api/admin/orders/:id',admin,(req,res)=>{const d=read(),o=d.orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'Order not found'});o.status=String(req.body.status||o.status);o.statusHistory.push({status:o.status,at:new Date().toISOString()});save(d);res.json(o)});
+app.patch('/api/admin/products/:id',admin,(req,res)=>{const d=read(),p=d.products.find(x=>x.id===req.params.id);if(!p)return res.status(404).json({error:'Product not found'});for(const k of ['price','stock','featured'])if(req.body[k]!==undefined)p[k]=k==='featured'?!!req.body[k]:money(req.body[k]);save(d);res.json(p)});
+app.post('/api/admin/products',admin,(req,res)=>{const d=read(),p=req.body;if(!p.id||!p.name||!Number.isFinite(Number(p.price)))return res.status(400).json({error:'Product id, name and price are required.'});if(d.products.some(x=>x.id===p.id))return res.status(409).json({error:'Product id already exists.'});const item={...p,price:money(p.price),stock:money(p.stock),featured:!!p.featured};d.products.push(item);save(d);res.status(201).json(item)});
+app.patch('/api/admin/settings',admin,(req,res)=>{const d=read();d.settings={...d.settings,...req.body};save(d);res.json(d.settings)});
+app.post('/api/admin/coupons',admin,(req,res)=>{const d=read(),c=req.body;if(!c.code||!Number(c.amount))return res.status(400).json({error:'Coupon code and amount are required.'});const coupon={code:String(c.code).toUpperCase(),type:c.type==='fixed'?'fixed':'percent',amount:money(c.amount),min:money(c.min),active:true};d.coupons=d.coupons.filter(x=>x.code!==coupon.code);d.coupons.push(coupon);save(d);res.status(201).json(coupon)});
+app.use(express.static(path.join(ROOT,'public')));app.get('*',(req,res)=>res.sendFile(path.join(ROOT,'public/index.html')));
+export default app;
+if(!process.env.VERCEL){const port=Number(process.env.PORT)||4242;app.listen(port,'0.0.0.0',()=>console.log(`Chai Culture API listening on ${port}`));}
+
